@@ -30,8 +30,10 @@ function calculate() {
   //resultDiv.innerHTML = `<div aria-busy="true">Calculating...</div>`
   resultDiv.innerHTML = `<progress></progress>`;
 
-  // Make GET request to the API
-  const apiUrl = `https://pepmass.fly.dev/calc/all_features?sequence=${sequence}`;
+  // Make GET request to the API (same origin as the served page).
+  // encodeURIComponent prevents special characters in the sequence from
+  // breaking the query string.
+  const apiUrl = `/calc/all_features?sequence=${encodeURIComponent(sequence)}`;
   fetch(apiUrl)
     .then(response => response.json())
     .then(data => {
@@ -49,7 +51,7 @@ function buildingBlocks() {
   if (blocks.trim() === '') {
     console.log("FooBar");
     bbdiv.innerHTML = `<progress></progress>`;
-    const apiUrl = `https://pepmass.fly.dev/building_blocks`;
+    const apiUrl = `/building_blocks`;
     fetch(apiUrl)
       .then(response => response.json())
       .then(data => {
@@ -78,7 +80,7 @@ function displayResult(data) {
   resultDiv.innerHTML = `
     <h4>Results:</h4>
     <b>Molecular Weight:</b> ${data.MolWt}<br />
-    <b>Exact Mass:</b> ${data.Exact}<br / >
+    <b>Exact Mass:</b> ${data.Exact}<br />
     <b>Molecular Formula:</b> ${createMolecularFormula(data['Mol Formula'])}<br />
     <b>HPLC-SIM Ions:</b> ${createSIMIonList(data['HPLC-SIM Ions'])}<br />
     <b>MolWt Ions:</b> ${createIonList(data['MolWt Ions'])}<br />

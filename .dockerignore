@@ -1,0 +1,9 @@
+.git
+.github
+.gitignore
+*.md
+LICENSE
+fly.toml
+__pycache__
+*.pyc
+.venv

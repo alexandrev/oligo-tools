@@ -1,6 +1,7 @@
 import os
 import re  # Regular Expressions for string handling
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 import pandas as pd
 from fastapi import FastAPI, Response
@@ -15,9 +16,9 @@ async def lifespan(app: FastAPI):
     hrms_ions = { 1: 1152.365, 2: 576.6864, 3: 384.7935, 4: 288.8471, 5: 231.2792, 6: 192.9007, 7: 165.4874, 8: 144.9274, 9: 128.9364, 10: 116.1435, 11: 105.6766 }
     mol_formula = {'C': 51, 'H': 61, 'O': 18, 'N': 9, 'S': 2, 'Cl': 0, 'I': 0, 'P': 0, 'Br': 0}
     features = calc_features(test_sequence)
-    if features["MolWt"] - 1152.2096 != 0:
+    if abs(features["MolWt"] - 1152.2096) > 1e-6:
         raise Exception("Implementation Error", "MolWt for test sequence was not calculated correctly")
-    if features["Exact"] - 1151.3572 != 0:
+    if abs(features["Exact"] - 1151.3572) > 1e-6:
         raise Exception("Implementation Error", "Exact mass for test sequence was not calculated correctly")
     if not features["HPLC-SIM Ions"] == sim_ions:
         raise Exception("Implementation Error", "HPLC-SIM ions for test sequence were not calculated correctly")
@@ -32,7 +33,7 @@ async def lifespan(app: FastAPI):
 description = """
 The PNA-Peptide-Conjucate Feature Calculation API allows you to calculate important features of these molecules!
 
-The source-code of the API is available on [Github](https://www.github.com) (TODO: Add repository URL after publishing to Github)  
+The source-code of the API is available on [Github](https://github.com/alexandrev/oligo-tools)
 A demo instance of the API is available on [Fly.io](https://pepmass.fly.dev/)
 
 """
@@ -57,10 +58,13 @@ origins = [
     "*"
 ]
 
+# Public, read-only API: allow any origin but do NOT allow credentials.
+# Combining allow_origins=["*"] with allow_credentials=True effectively reflects
+# any Origin while permitting cookies/Authorization, which is unsafe.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -198,10 +202,14 @@ async def all_features(sequence: str):
     """
     return calc_features(sequence)
 
+@lru_cache(maxsize=1)
 def input_monomers() -> pd.DataFrame:
-    # Read properties of monomers from Excel generated .csv-file
-    input_monomers = pd.read_csv('Massen.csv', sep=";")
-    return input_monomers
+    # Read properties of monomers from Excel generated .csv-file.
+    # Cached: the file is static, so it is parsed once instead of on every
+    # lookup (previously re-read from disk hundreds of times per request).
+    # Path is resolved relative to this file so it works from any working dir.
+    root = os.path.dirname(os.path.abspath(__file__))
+    return pd.read_csv(os.path.join(root, 'Massen.csv'), sep=";")
 
 def split_sequence(sequence: str) -> list:
     # Split input string at all whitespaces
@@ -232,10 +240,13 @@ def add_building_block(mass: float, formula: dict, building_block: str, weight: 
             for atom in atoms:
                 formula[atom] -= int(input_monomers().loc[input_monomers()["Group"]==leaving, atom].values[0])
     except IndexError:
+        # Unknown building block: fall back to the "UKN" placeholder for BOTH
+        # mass and formula. Previously the formula lookup still used the unknown
+        # `building_block`, raising a second IndexError and returning HTTP 500.
         mass += (input_monomers().loc[input_monomers()["Group"]=="UKN", weight].values[0])
         leaving = (input_monomers().loc[input_monomers()["Group"]=="UKN", "Leaving"].values[0])
         for atom in atoms:
-            formula[atom] += (input_monomers().loc[input_monomers()["Group"]==building_block, atom].values[0])
+            formula[atom] += int(input_monomers().loc[input_monomers()["Group"]=="UKN", atom].values[0])
 
         if leaving != "---":
             mass -= (input_monomers().loc[input_monomers()["Group"]==leaving, weight].values[0])
@@ -244,14 +255,15 @@ def add_building_block(mass: float, formula: dict, building_block: str, weight: 
 
     return mass, formula
 
-def calc_features(sequence: str) -> list:
+def calc_features(sequence: str) -> dict:
     molwt = 0
     exact = 0
     formula = {'C': 0, 'H': 0, 'O': 0, 'N': 0, 'S': 0, 'Cl': 0, 'I': 0, 'P': 0, 'Br': 0}
     termination_seq = ""
     termination_seq_df = pd.DataFrame()
     dummy = {'C': 0, 'H': 0, 'O': 0, 'N': 0, 'S': 0, 'Cl': 0, 'I': 0, 'P': 0, 'Br': 0}
-    for idx, monomer in enumerate(split_sequence(sequence)):
+    monomers = split_sequence(sequence)
+    for idx, monomer in enumerate(monomers):
         # If Monomer contains bracketed statement add the mass of the bracketed monomer as well
         if re.search('\(.*\)', monomer):
             m = re.search('(.*)\((.*)\)', monomer)
@@ -262,7 +274,7 @@ def calc_features(sequence: str) -> list:
             exact, dummy = add_building_block(exact, dummy, monomer, "Exact")
             exact, dummy = add_building_block(exact, dummy, modifier, "Exact")
             termination_seq = monomer + "(" + modifier + ") " + termination_seq
-            if (idx>0 and idx < len(split_sequence(sequence))-1):
+            if (idx>0 and idx < len(monomers)-1):
                 molwt_ac, dummy = add_building_block(molwt, dummy, "Ac", "MolWt")
                 exact_ac, dummy = add_building_block(exact, dummy, "Ac", "Exact")
                 row = {
@@ -280,7 +292,7 @@ def calc_features(sequence: str) -> list:
             molwt, formula = add_building_block(molwt, formula, monomer, "MolWt")
             exact, dummy = add_building_block(exact, dummy, monomer, "Exact")
             termination_seq = monomer + " " + termination_seq
-            if (idx>0 and idx < len(split_sequence(sequence))-1):
+            if (idx>0 and idx < len(monomers)-1):
                 molwt_ac, dummy = add_building_block(molwt, dummy, "Ac", "MolWt")
                 exact_ac, dummy = add_building_block(exact, dummy, "Ac", "Exact")
                 row = {
