@@ -19,15 +19,76 @@ function resetInput() {
   `;
 }
 
-function calculate() {
-  const sequence = document.getElementById('sequenceInput').value;
-  if (sequence.trim() === '') {
+// Cached, length-sorted list of known building blocks for the "did you mean"
+// tokenizer, fetched from the same /building_blocks endpoint the UI uses.
+let _knownBlocks = null;
+async function loadKnownBlocks() {
+  if (_knownBlocks) return _knownBlocks;
+  try {
+    const data = await (await fetch(`/building_blocks`)).json();
+    const all = [];
+    for (const key of ['AminoAcids', 'PNAmonomers', 'ProtectingGroups', 'Fluorophores', 'CTerminalModifications']) {
+      if (data[key]) data[key].split(',').forEach(x => { x = x.trim(); if (x) all.push(x); });
+    }
+    ['Ac', 'H2N', 'FAM', 'TAMRA', 'COOH', 'CONH2', 'p'].forEach(x => all.push(x));
+    // longest first so the greedy match prefers multi-letter codes (e.g. "Ac" over "A")
+    _knownBlocks = [...new Set(all)].sort((a, b) => b.length - a.length);
+  } catch (e) {
+    _knownBlocks = [];
+  }
+  return _knownBlocks;
+}
+
+// Greedy longest-match tokenizer: split a space-less string into known building
+// blocks, or return null if it cannot be fully resolved. Case-sensitive on
+// purpose ("c" = PNA cytosine, "C" = cysteine).
+function tokenizeStuck(str, blocks) {
+  const out = [];
+  let i = 0;
+  while (i < str.length) {
+    const match = blocks.find(b => str.startsWith(b, i));
+    if (!match) return null;
+    out.push(match);
+    i += match.length;
+  }
+  return out;
+}
+
+function applySuggestion(seq) {
+  document.getElementById('sequenceInput').value = seq;
+  calculate();
+}
+
+async function calculate() {
+  const sequence = document.getElementById('sequenceInput').value.trim();
+  if (sequence === '') {
     alert('Please enter a sequence.');
     return;
   }
 
+  // "Did you mean?" — if an unknown token looks like several monomers stuck
+  // together, suggest the spaced version instead of silently computing the
+  // "UKN" placeholder. Skipped for bracketed/disulfide notation.
+  if (!/[()~]/.test(sequence)) {
+    const blocks = await loadKnownBlocks();
+    if (blocks.length) {
+      const known = new Set(blocks);
+      const parts = sequence.split(/\s+/);
+      if (!parts.every(p => known.has(p))) {
+        const guess = tokenizeStuck(sequence.replace(/\s+/g, ''), blocks);
+        if (guess && guess.length > 1 && guess.join(' ') !== sequence) {
+          const spaced = guess.join(' ');
+          document.getElementById('responsive_area').innerHTML =
+            `<b>Did you mean:</b> <span style="font-family:monospace">${spaced}</span> ` +
+            `<button type="button" onclick="applySuggestion('${spaced}')">Use this</button>` +
+            `<br /><small>Separate every monomer with a space (case matters: c = PNA, C = Cys).</small>`;
+          return;
+        }
+      }
+    }
+  }
+
   const resultDiv = document.getElementById('responsive_area');
-  //resultDiv.innerHTML = `<div aria-busy="true">Calculating...</div>`
   resultDiv.innerHTML = `<progress></progress>`;
 
   // Make GET request to the API (same origin as the served page).
