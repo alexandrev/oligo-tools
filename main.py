@@ -211,6 +211,25 @@ def input_monomers() -> pd.DataFrame:
     root = os.path.dirname(os.path.abspath(__file__))
     return pd.read_csv(os.path.join(root, 'Massen.csv'), sep=";")
 
+@lru_cache(maxsize=1)
+def monomer_index() -> dict:
+    # Group -> {column: value} lookup, built once from the CSV. Turns each
+    # monomer property access into an O(1) dict access instead of an O(n)
+    # DataFrame boolean scan (`df.loc[df["Group"]==x]`) that previously ran
+    # hundreds of times per request (≈9 per monomer just for the formula).
+    #
+    # Values are taken from the raw numpy column arrays so each entry is the
+    # exact same numpy scalar (np.float64 / np.int64) that the previous
+    # `.loc[...].values[0]` returned. This matters: mixing numpy and Python
+    # floats would change round()'s half-to-even behaviour on some values.
+    df = input_monomers()
+    cols = {c: df[c].values for c in df.columns}
+    index = {}
+    for i, group in enumerate(cols["Group"]):
+        if group not in index:  # first occurrence wins, matching .values[0]
+            index[group] = {c: cols[c][i] for c in df.columns}
+    return index
+
 def split_sequence(sequence: str) -> list:
     # Split input string at all whitespaces
     seq = re.split("\s+", sequence.strip())
@@ -219,7 +238,7 @@ def split_sequence(sequence: str) -> list:
 
 def calc_multi_ions(mass: float, adduct: str, weight: str, min_wt: int, max_wt: int, digits: int | None = 4) -> dict:
     multi_ions = {}
-    adduct_wt = input_monomers().loc[input_monomers()["Group"]==adduct, weight].values[0]
+    adduct_wt = monomer_index()[adduct][weight]
     for i in range(100,0,-1):
         ion = round((mass + (i * adduct_wt))/i, digits)
         if (ion > min_wt and ion < max_wt):
@@ -228,30 +247,22 @@ def calc_multi_ions(mass: float, adduct: str, weight: str, min_wt: int, max_wt: 
 
 def add_building_block(mass: float, formula: dict, building_block: str, weight: str) -> tuple[float, dict]:
     atoms = ['C', 'H', 'O', 'N', 'S', 'Cl', 'I', 'P', 'Br']
+    index = monomer_index()
 
-    try:
-        mass += (input_monomers().loc[input_monomers()["Group"]==building_block, weight].values[0])
-        leaving = (input_monomers().loc[input_monomers()["Group"]==building_block, "Leaving"].values[0])
+    # Unknown building block: fall back to the "UKN" placeholder for BOTH mass
+    # and formula (UKN has deliberately huge values so it does not go unnoticed).
+    block = index.get(building_block, index["UKN"])
+
+    mass += block[weight]
+    for atom in atoms:
+        formula[atom] += int(block[atom])
+
+    leaving = block["Leaving"]
+    if leaving != "---":
+        leaving_block = index[leaving]
+        mass -= leaving_block[weight]
         for atom in atoms:
-            formula[atom] += int(input_monomers().loc[input_monomers()["Group"]==building_block, atom].values[0])
-
-        if leaving != "---":
-            mass -= (input_monomers().loc[input_monomers()["Group"]==leaving, weight].values[0])
-            for atom in atoms:
-                formula[atom] -= int(input_monomers().loc[input_monomers()["Group"]==leaving, atom].values[0])
-    except IndexError:
-        # Unknown building block: fall back to the "UKN" placeholder for BOTH
-        # mass and formula. Previously the formula lookup still used the unknown
-        # `building_block`, raising a second IndexError and returning HTTP 500.
-        mass += (input_monomers().loc[input_monomers()["Group"]=="UKN", weight].values[0])
-        leaving = (input_monomers().loc[input_monomers()["Group"]=="UKN", "Leaving"].values[0])
-        for atom in atoms:
-            formula[atom] += int(input_monomers().loc[input_monomers()["Group"]=="UKN", atom].values[0])
-
-        if leaving != "---":
-            mass -= (input_monomers().loc[input_monomers()["Group"]==leaving, weight].values[0])
-            for atom in atoms:
-                formula[atom] -= int(input_monomers().loc[input_monomers()["Group"]==leaving, atom].values[0])
+            formula[atom] -= int(leaving_block[atom])
 
     return mass, formula
 
@@ -260,7 +271,7 @@ def calc_features(sequence: str) -> dict:
     exact = 0
     formula = {'C': 0, 'H': 0, 'O': 0, 'N': 0, 'S': 0, 'Cl': 0, 'I': 0, 'P': 0, 'Br': 0}
     termination_seq = ""
-    termination_seq_df = pd.DataFrame()
+    termination_rows = []
     dummy = {'C': 0, 'H': 0, 'O': 0, 'N': 0, 'S': 0, 'Cl': 0, 'I': 0, 'P': 0, 'Br': 0}
     monomers = split_sequence(sequence)
     for idx, monomer in enumerate(monomers):
@@ -285,8 +296,7 @@ def calc_features(sequence: str) -> dict:
                     "MolWt-Ac": float(round(molwt_ac,2)),
                     "Exact Mass-Ac": float(round(exact_ac,4))
                 }
-                row_df = pd.DataFrame(data=row, index=[0])
-                termination_seq_df = pd.concat([termination_seq_df,row_df], ignore_index=True)            
+                termination_rows.append(row)            
         # Else only add mass of building block
         else:
             molwt, formula = add_building_block(molwt, formula, monomer, "MolWt")
@@ -303,8 +313,7 @@ def calc_features(sequence: str) -> dict:
                     "MolWt-Ac": float(round(molwt_ac,2)),
                     "Exact Mass-Ac": float(round(exact_ac,4))
                 }
-                row_df = pd.DataFrame(data=row, index=[0])
-                termination_seq_df = pd.concat([termination_seq_df,row_df], ignore_index=True)
+                termination_rows.append(row)
 
     result = {
         "MolWt": round(molwt,4),
@@ -313,7 +322,7 @@ def calc_features(sequence: str) -> dict:
         "HPLC-SIM Ions": calc_multi_ions(molwt, "Hplus", "MolWt", 100, 50000, 0),
         "MolWt Ions": calc_multi_ions(molwt, "Hplus", "MolWt", 100, 50000, 2),
         "HRMS Ions": calc_multi_ions(exact, "Hplus", "Exact", 100, 50000, 4),
-        "Termination Sequences" : termination_seq_df.to_dict(orient='records')   
+        "Termination Sequences" : pd.DataFrame(termination_rows).to_dict(orient='records')   
     }
         #"Termination Sequences" : termination_seq_df.to_json(orient="records", lines=False).replace('\"', '*')
     return (result)
